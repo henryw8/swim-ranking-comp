@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# Project folders (not tracked)
+data/
+docs/
+
+# macOS
+.DS_Store
