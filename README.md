@@ -44,6 +44,34 @@ source_sha256, retrieved_at`.
   a SHA-256 checksum; `source_pdf` points to archived copies under
   `data/reference/world_aquatics_base_time_sources/`.
 
+### US Open records (SCY)
+
+`data/us_open_records_scy.csv` (shared across classes) holds the short course
+yards U.S. Open swimming records — fastest times swum on American soil
+regardless of nationality — for all individual events (no relays): 28 rows,
+men and women. Scraped from [Wikipedia's List of United States records in
+swimming](https://en.wikipedia.org/wiki/List_of_United_States_records_in_swimming)
+by `scripts/scrape_us_open_records.py` (rerun it to refresh). Columns: `course,
+gender, event, distance, stroke, time_display, time_seconds, swimmer,
+nationality, team, meet, record_date, date_display, location, record_notes,
+same_as_american_record, source_url, retrieved_at`.
+
+- Where Wikipedia marks the U.S. Open record as "same" as the American record,
+  the entry is resolved from the American record cell and
+  `same_as_american_record` is `True`.
+- `nationality` is filled only for non-American record holders.
+- `record_notes` carries the page's legend markers when present ("world
+  record", "awaiting ratification", "en route to final mark") and, for tied
+  records, who equalled the mark and when — the row itself keeps the original
+  swim. A meet ending in `(p)`/`(sf)`/`(r)` means the record was set in a
+  preliminary/semifinal/relay leadoff.
+- `--as-of YYYY-MM-DD` scrapes the last Wikipedia revision on or before that
+  date instead — the records as they stood then — and writes
+  `us_open_records_scy_asof_<date>.csv`, with `source_url` pinned to the exact
+  revision. `data/us_open_records_scy_asof_2025-12-31.csv` (revision of
+  2025-12-30) is the year-end-2025 snapshot; it differs from the current file
+  on six events whose record fell in Jan–Mar 2026.
+
 Notes on the data:
 
 - Lifetime bests are SwimCloud `profile_fastest_times` records — one fastest

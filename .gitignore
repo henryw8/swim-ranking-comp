@@ -7,6 +7,7 @@ __pycache__/
 # Project folders (not tracked)
 data/
 docs/
+tasks/
 
 # macOS
 .DS_Store
