@@ -152,11 +152,15 @@ re-expressed as its equal-point SCY score and the slot-weighted composite
 rebuilt (`swimmer_impact.csv` + `swimmer_impact_distribution.png`; 100 IM
 meter swims have no yard baseline and stay unconverted, counted per swimmer).
 The primary `pi_penalty` fixes the portfolio to the swimmer's actual top-4
-events — the slots SwimCloud actually scored — and re-values each neutrally,
-so stale meter swims outside the portfolio can't distort the number; the
-`pi_penalty_rerank` sensitivity column instead re-ranks all events under
-counterfactual scores (captures meter events unfairly scored out of the top
-4, but stale meter swims in high-δ events can be promoted; always ≥ the
+events and re-values only the swims that actually contribute: yard-valued
+slots are unchanged, and a meter-valued slot has its winning swim converted
+(falling back to the swimmer's own yard swim in that event if conversion
+devalues the meter swim below it). A swimmer is therefore affected iff a
+meter swim values one of their scoring slots (`n_meter_valued_slots > 0`) —
+stale, non-contributing meter swims can never surface. The
+`pi_penalty_rerank` sensitivity column instead converts everything and
+re-ranks all events (captures meter events unfairly scored out of the top 4,
+but stale meter swims in high-δ events can be promoted; always ≥ the
 fixed-portfolio penalty). The composite is top-4 by construction — the flag
 is independent of `--top-events`, which only filters the event-level matrix.
 Canonical run: `--max-rank 1000 --top-events 4 --swimmer-impact`, keeping all

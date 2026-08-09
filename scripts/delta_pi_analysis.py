@@ -387,12 +387,15 @@ def swimmer_impact(best: pd.Series, record_bases: dict, pi_bases: dict, swimmer_
     against C_SCY) and the slot-weighted index is rebuilt two ways.
 
     Primary (pi_penalty): the portfolio is FIXED to the swimmer's actual top-4
-    events — the slots SwimCloud actually scored — and each is re-valued
-    neutrally (within-event, the best counterfactual course wins). Immune to
-    stale meter swims being promoted by the conversion.
+    events — the slots SwimCloud actually scored — and only CONTRIBUTING swims
+    are re-valued: a yard-valued event is unchanged, a meter-valued event gets
+    its winning swim converted (falling back to the swimmer's own yard swim in
+    that event if conversion devalues the meter swim below it). Non-scoring
+    meter swims can never surface, so a swimmer is affected iff a meter swim
+    actually values one of their scoring events (n_meter_valued_slots > 0).
 
-    Sensitivity (pi_penalty_rerank): all events re-ranked under counterfactual
-    scores before taking the top 4. Captures portfolio-selection distortion
+    Sensitivity (pi_penalty_rerank): all swims converted and all events
+    re-ranked before taking the top 4. Captures portfolio-selection distortion
     (a meter event unfairly scored out of the top 4) but can be inflated by
     stale meter swims in high-delta events; always >= pi_penalty.
 
@@ -423,13 +426,23 @@ def swimmer_impact(best: pd.Series, record_bases: dict, pi_bases: dict, swimmer_
 
     rows = []
     for sid, grp in df.groupby("swimmer_id"):
-        actual_events = grp.groupby(["canon_distance", "stroke"])["score"].min()
-        cf_events = grp.groupby(["canon_distance", "stroke"])["cf_score"].min()
-        # the swimmer's actual scoring portfolio: 4 lowest actual event scores
-        portfolio = actual_events.sort_index(kind="mergesort").sort_values(kind="mergesort").index[:4]
-        actual_idx = weighted_index(actual_events.tolist())
-        cf_fixed_idx = weighted_index(cf_events.loc[portfolio].tolist())
-        cf_rerank_idx = weighted_index(cf_events.tolist())
+        # per event: the contributing (winning) swim, with deterministic ties
+        winners = grp.sort_values(["score", "course"], kind="mergesort").drop_duplicates(
+            ["canon_distance", "stroke"]
+        )
+        yard_best = grp[grp["course"] == "SCY"].groupby(["canon_distance", "stroke"])["score"].min()
+        strict_cf = [
+            w.score
+            if w.course == "SCY"
+            else min(w.cf_score, yard_best.get((w.canon_distance, w.stroke), np.inf))
+            for w in winners.itertuples()
+        ]
+        portfolio = winners.iloc[:4]  # already sorted: the actual scoring slots
+        actual_idx = weighted_index(winners["score"].tolist())
+        cf_fixed_idx = weighted_index(strict_cf[:4])
+        cf_rerank_idx = weighted_index(
+            grp.groupby(["canon_distance", "stroke"])["cf_score"].min().tolist()
+        )
         info = swimmer_info.loc[sid]
         rows.append(
             {
@@ -443,6 +456,7 @@ def swimmer_impact(best: pd.Series, record_bases: dict, pi_bases: dict, swimmer_
                 "pi_penalty": round(actual_idx - cf_fixed_idx, 3),
                 "counterfactual_index_rerank": round(cf_rerank_idx, 3),
                 "pi_penalty_rerank": round(actual_idx - cf_rerank_idx, 3),
+                "n_meter_valued_slots": int((portfolio["course"] != "SCY").sum()),
                 "n_meter_swims": int(grp["is_meter"].sum()),
                 "n_unconverted_meter_swims": int(grp["unconverted"].sum()),
             }
@@ -481,9 +495,9 @@ def swimmer_impact_figure(impact: pd.DataFrame, snapshot_date: str, pop_note: st
     )
     fig.text(
         0.01, 0.955,
-        "Per swimmer: composite PI (top-4, weights 1/1/0.25/0.05) minus its counterfactual with the portfolio fixed\n"
-        "to the actual top-4 events, each re-valued at its equal-WA-point yard score. Curve height at x = share of\n"
-        f"swimmers penalized by ≥ x points; left of 0 = favored. Population: clean bests{pop_note}. Snapshot {snapshot_date}.",
+        "Per swimmer: composite PI (top-4, weights 1/1/0.25/0.05) minus its counterfactual where each scoring meter\n"
+        "swim is re-valued at its equal-WA-point yard score (yard-valued slots unchanged). Curve height at x = share\n"
+        f"of swimmers penalized by ≥ x points; left of 0 = favored. Population: clean bests{pop_note}. Snapshot {snapshot_date}.",
         va="top", fontsize=7.5, color=INK_2,
     )
     fig.subplots_adjust(top=0.82, bottom=0.11, left=0.075, right=0.99)
