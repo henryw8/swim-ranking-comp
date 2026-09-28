@@ -1,11 +1,11 @@
 """Clean and enrich each recruiting-class snapshot into analysis-ready artifacts.
 
-For every data/swimcloud_YYYY/ this writes data/processed/swimcloud_YYYY/:
+For every data/swimcloud_YYYY*/ this writes data/processed/swimcloud_YYYY*/:
   swims_clean.csv        every lifetime-best row, typed + flagged + WA-enriched
   rankings_clean.csv     typed rankings
   validation_report.json row reconciliation, WA recompute match rates, flag inventory
 
-Usage: uv run scripts/process_data.py [--classes 2026 ...]
+Usage: uv run scripts/process_data.py [--classes 2026 ...] [--datasets swimcloud_2027_new ...]
 """
 
 import argparse
@@ -29,6 +29,10 @@ from swimlib import (
 
 BOOL_COLS = ["legal", "exhibition", "is_user_inputted", "is_relay_leadoff", "is_extracted_split"]
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+RANKING_COLS = [
+    "gender", "rank", "swimmer_id", "name", "location", "commitment",
+    "power_index", "profile_url", "retrieved_at",
+]
 
 
 def read_csv_raw(path: Path) -> pd.DataFrame:
@@ -39,17 +43,40 @@ def to_float(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series.replace("", None), errors="coerce")
 
 
+def load_snapshot(class_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Load either the legacy split snapshot or cutoff exports with ranking
+    fields embedded in every swim row."""
+    swims_path = class_dir / "lifetime_bests_combined.csv"
+    rankings_path = class_dir / "rankings_combined.csv"
+    if swims_path.exists() and rankings_path.exists():
+        return read_csv_raw(swims_path), read_csv_raw(rankings_path)
+
+    cutoff_paths = sorted(class_dir.glob("class_*_power_index_cutoff_*_swims_through_*.csv"))
+    if not cutoff_paths:
+        raise SystemExit(
+            f"{class_dir} has neither legacy combined files nor power-index cutoff exports"
+        )
+    swims = pd.concat([read_csv_raw(path) for path in cutoff_paths], ignore_index=True)
+    missing = [col for col in RANKING_COLS if col not in swims]
+    if missing:
+        raise SystemExit(f"{class_dir}: cutoff exports missing ranking columns {missing}")
+    rankings = swims[RANKING_COLS].drop_duplicates("swimmer_id", keep="first").copy()
+    return swims, rankings
+
+
 def process_class(class_dir: Path, wa_lookup: dict, out_root: Path) -> dict:
-    recruiting_class = int(class_dir.name.rsplit("_", 1)[1])
+    match = re.fullmatch(r"swimcloud_(\d+)(?:_.+)?", class_dir.name)
+    if not match:
+        raise SystemExit(f"cannot infer recruiting class from {class_dir.name}")
+    recruiting_class = int(match.group(1))
     out_dir = out_root / class_dir.name
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    swims = read_csv_raw(class_dir / "lifetime_bests_combined.csv")
-    rankings = read_csv_raw(class_dir / "rankings_combined.csv")
+    swims, rankings = load_snapshot(class_dir)
     n_in = len(swims)
 
     for col in BOOL_COLS:
-        swims[col] = swims[col] == "true"
+        swims[col] = swims[col].str.lower() == "true"
     t = to_float(swims["time_seconds"])
     sc_points = to_float(swims["performance_points"])
     wa_points = to_float(swims["world_aquatics_points"])
@@ -192,11 +219,26 @@ def build_report(swims: pd.DataFrame, rankings: pd.DataFrame, recruiting_class: 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--classes", nargs="*", type=int, help="recruiting classes (default: all found)")
+    parser.add_argument(
+        "--datasets", nargs="*",
+        help="exact data directory names, e.g. swimcloud_2027_new (takes precedence over --classes)",
+    )
     args = parser.parse_args()
 
-    class_dirs = sorted(d for d in DATA_DIR.glob("swimcloud_*") if d.is_dir())
-    if args.classes:
-        class_dirs = [d for d in class_dirs if int(d.name.rsplit("_", 1)[1]) in args.classes]
+    if args.datasets:
+        class_dirs = [DATA_DIR / name for name in args.datasets]
+        missing = [str(d) for d in class_dirs if not d.is_dir()]
+        if missing:
+            raise SystemExit(f"data directories not found: {', '.join(missing)}")
+    else:
+        class_dirs = sorted(d for d in DATA_DIR.glob("swimcloud_*") if d.is_dir())
+        if args.classes:
+            wanted = set(args.classes)
+            class_dirs = [
+                d for d in class_dirs
+                if (m := re.fullmatch(r"swimcloud_(\d+)(?:_.+)?", d.name))
+                and int(m.group(1)) in wanted
+            ]
     if not class_dirs:
         raise SystemExit("no data/swimcloud_* directories matched")
 

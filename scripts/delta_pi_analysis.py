@@ -41,6 +41,8 @@ Usage: uv run scripts/delta_pi_analysis.py [--classes 2027 ...] [--max-rank N] [
 
 import argparse
 import json
+from datetime import date
+from pathlib import Path
 
 import matplotlib
 
@@ -48,9 +50,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.cm import ScalarMappable
+from matplotlib.colors import LinearSegmentedColormap, Normalize
 from matplotlib.lines import Line2D
-from matplotlib.patches import Patch
+from matplotlib.patches import Patch, Rectangle
 
 from audit_calibration import (
     COURSE_PAIRS,
@@ -72,13 +75,12 @@ NON_NCAA_EVENTS = {(50, "backstroke"), (50, "breaststroke"), (50, "butterfly")}
 # SwimCloud's published-index slot weights: events 1-2 full, 3rd 25%, 4th 5%
 PI_SLOT_WEIGHTS = (1.0, 1.0, 0.25, 0.05)
 
-# chart chrome (dataviz reference palette, light mode)
-SURFACE = "#fcfcfb"
+# minimal chart chrome
+SURFACE = "#ffffff"
 INK = "#0b0b0b"
-INK_2 = "#52514e"
-MUTED = "#898781"
-GRID = "#e1e0d9"
-BASELINE = "#c3c2b7"
+INK_2 = "#555555"
+MUTED = "#888888"
+BASELINE = "#c8c8c8"
 CURVE = "#2a78d6"  # categorical slot 1
 HIST = "#9ec5f4"  # sequential step 200
 DIVERGING = ["#0d366b", "#3987e5", "#f0efec", "#e34948", "#7a1f1f"]  # blue <- gray -> red
@@ -87,16 +89,11 @@ plt.rcParams.update(
     {
         "figure.facecolor": SURFACE,
         "savefig.facecolor": SURFACE,
-        "axes.facecolor": SURFACE,
+        "axes.grid": False,
         "axes.edgecolor": BASELINE,
         "axes.linewidth": 0.8,
-        "axes.grid": True,
-        "grid.color": GRID,
-        "grid.linewidth": 0.6,
-        "xtick.color": MUTED,
-        "ytick.color": MUTED,
-        "axes.labelcolor": INK_2,
-        "text.color": INK,
+        "axes.spines.top": False,
+        "axes.spines.right": False,
         "font.size": 8,
     }
 )
@@ -115,6 +112,23 @@ def best_times_by_event(swims: pd.DataFrame) -> pd.Series:
     the population whose P distribution the curves are marginalized over."""
     clean = swims[swims["is_clean"] & swims["time_seconds"].notna() & (swims["time_seconds"] > 0)]
     return clean.groupby(["gender", "course", "distance", "stroke", "swimmer_id"])["time_seconds"].min()
+
+
+def load_processed_datasets(datasets: list[str]) -> pd.DataFrame:
+    """Load explicitly named processed snapshots using the audit loader's
+    typing conventions."""
+    frames = []
+    for dataset in datasets:
+        path = PROCESSED_DIR / dataset / "swims_clean.csv"
+        if not path.exists():
+            raise SystemExit(f"{path} missing — run scripts/process_data.py first")
+        df = pd.read_csv(path, dtype=str, keep_default_na=False)
+        for col in ["time_seconds", "world_aquatics_points", "implied_wa_base", "implied_sc_base", "quality_factor"]:
+            df[col] = pd.to_numeric(df[col].replace("", None), errors="coerce")
+        df["distance"] = pd.to_numeric(df["distance"].replace("", None), errors="coerce").astype("Int64")
+        df["is_clean"] = df["is_clean"] == "true"
+        frames.append(df)
+    return pd.concat(frames, ignore_index=True)
 
 
 def event_course_scores(best: pd.Series, pi_bases: dict) -> pd.DataFrame:
@@ -239,9 +253,9 @@ def delta_pi_rows(best: pd.Series, record_bases: dict, pi_bases: dict, scy_sourc
     return rows, p_arrays, skipped
 
 
-def matrix_frame(long: pd.DataFrame, gender: str) -> pd.DataFrame:
+def matrix_frame(long: pd.DataFrame, gender: str, col: str = "dpi_mean") -> pd.DataFrame:
     """The matrix X for one gender: rows = events (program order), columns =
-    course pairs, cells = E_P[dPi]."""
+    course pairs, cells = the requested column (E_P[dPi] by default)."""
     sub = long[long["gender"] == gender]
     events = program_sorted({(int(r.distance), r.stroke) for r in sub.itertuples()})
     mat = pd.DataFrame(
@@ -250,7 +264,7 @@ def matrix_frame(long: pd.DataFrame, gender: str) -> pd.DataFrame:
             **{
                 pair: [
                     next(
-                        (r.dpi_mean for r in sub.itertuples()
+                        (getattr(r, col) for r in sub.itertuples()
                          if int(r.distance) == d and r.stroke == s and r.course_pair == pair),
                         None,
                     )
@@ -263,7 +277,7 @@ def matrix_frame(long: pd.DataFrame, gender: str) -> pd.DataFrame:
     return mat
 
 
-def curves_figure(gender: str, pair: str, sub: pd.DataFrame, p_arrays: dict, pop_note: str, out_path) -> None:
+def curves_figure(gender: str, pair: str, sub: pd.DataFrame, p_arrays: dict, cohort: str, out_path) -> None:
     events = program_sorted({(int(r.distance), r.stroke) for r in sub.itertuples()})
     rows = {(int(r.distance), r.stroke): r for r in sub.itertuples()}
     spans = [
@@ -295,12 +309,15 @@ def curves_figure(gender: str, pair: str, sub: pd.DataFrame, p_arrays: dict, pop
                     (bins[:-1] + bins[1:]) / 2, heights, width=bins[1] - bins[0],
                     bottom=y_lo, color=HIST, lw=0, zorder=0.8,
                 )
-        ax.plot(grid, r.curve_k / grid, color=CURVE, lw=1.8, zorder=2)
-        ax.set_title(event_label(d, s), loc="left", fontsize=8, fontweight="bold", color=INK)
-        note = f"δ {r.delta_pct:+.2f}%"
-        if r.dpi_mean is not None:
-            note += f"\nE[ΔΠ] {r.dpi_mean:+.1f} · n {r.n_athletes:,}"
-        ax.text(0.97, 0.94, note, transform=ax.transAxes, ha="right", va="top", fontsize=6.5, color=INK_2, zorder=3)
+        ax.plot(grid, r.curve_k / grid, color=CURVE, lw=1.5, zorder=2)
+        ax.set_title(event_label(d, s), loc="left", fontsize=8)
+        note = f"n={int(r.n_athletes):,}"
+        if pd.notna(r.dpi_mean):
+            note = f"mean {r.dpi_mean:+.1f} · " + note
+        ax.text(
+            0.97, 0.94, note, transform=ax.transAxes,
+            ha="right", va="top", fontsize=6.5, color=INK_2, zorder=3,
+        )
         ax.set_xlim(x_lo, x_hi)
         ax.set_ylim(y_lo, y_hi)
         ax.tick_params(labelsize=6.5)
@@ -308,67 +325,87 @@ def curves_figure(gender: str, pair: str, sub: pd.DataFrame, p_arrays: dict, pop
         ax.set_visible(False)
     num, den = pair.split("/")
     fig.suptitle(
-        f"Power Index gap between equal-point swims — {GENDER_LABEL[gender]}, {pair}",
-        x=0.01, ha="left", fontsize=11, fontweight="bold", color=INK,
-    )
-    fig.text(
-        0.01, 0.945,
-        f"ΔΠ(P) = K/P with K = 10⁵(ρ³_{num} − ρ³_{den});  ΔΠ > 0: the {num} representation scores worse.",
-        fontsize=7.5, color=INK_2,
+        f"Power Index gap between equal-point {num} and {den} swims — {cohort}",
+        x=0.01, ha="left", fontsize=10,
     )
     fig.legend(
         handles=[
-            Line2D([], [], color=CURVE, lw=1.8, label="ΔΠ(P) = K/P"),
-            Patch(facecolor=HIST, label=f"P distribution — clean best-per-athlete {num} swims{pop_note} (per-panel scale)"),
+            Line2D([], [], color=CURVE, lw=1.5, label="SC power index gap at equal WA points"),
+            Patch(facecolor=HIST, label=f"WA points distribution of {num} swims contributing to power indexes"),
         ],
         loc="upper right", bbox_to_anchor=(0.995, 1.0), frameon=False, fontsize=7.5,
     )
-    fig.supxlabel("P (World Aquatics points)", fontsize=8.5, color=INK_2)
-    fig.supylabel(f"ΔΠ = Π_{num} − Π_{den} (index points)", fontsize=8.5, color=INK_2)
-    fig.subplots_adjust(top=0.885, bottom=0.09, left=0.065, right=0.99, hspace=0.42, wspace=0.08)
+    fig.supxlabel("WA points", fontsize=8.5)
+    fig.supylabel("SC power index gap", x=0.008, fontsize=8.5)
+    fig.text(
+        0.024, 0.5, f"positive: {num} disadvantaged · negative: {num} advantaged",
+        rotation=90, ha="center", va="center", fontsize=7, color=INK_2,
+    )
+    fig.subplots_adjust(top=0.885, bottom=0.09, left=0.08, right=0.99, hspace=0.42, wspace=0.08)
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
 
 
-def matrix_figure(gender: str, mat: pd.DataFrame, snapshot_date: str, pop_note: str, out_path) -> None:
+def matrix_figure(mat: pd.DataFrame, n_mat: pd.DataFrame, cohort: str, out_path) -> None:
     vals = mat[PAIR_NAMES].to_numpy(float)
+    ns = n_mat[PAIR_NAMES].to_numpy(float)
     vmax = float(np.nanmax(np.abs(vals)))
     cmap = LinearSegmentedColormap.from_list("bwr_ref", DIVERGING)
-    cmap.set_bad(SURFACE)
-    fig, ax = plt.subplots(figsize=(5.8, 0.36 * len(mat) + 1.9))
+    norm = Normalize(-vmax, vmax)
+    # rows keep height 1; a gap opens wherever the stroke changes
+    strokes = [e.split()[-1] for e in mat["event"]]
+    gap = 0.55
+    row_tops, y = [], 0.0
+    for i, stroke in enumerate(strokes):
+        if i and stroke != strokes[i - 1]:
+            y += gap
+        row_tops.append(y)
+        y += 1.0
+    fig, ax = plt.subplots(figsize=(6.2, 0.32 * y + 1.5))
     ax.grid(False)
-    mesh = ax.pcolormesh(
-        np.ma.masked_invalid(vals), cmap=cmap, vmin=-vmax, vmax=vmax,
-        edgecolors=SURFACE, linewidth=2,
-    )
-    ax.invert_yaxis()
-    ax.set_xticks(np.arange(len(PAIR_NAMES)) + 0.5, PAIR_NAMES, fontsize=8, color=INK_2)
-    ax.set_yticks(np.arange(len(mat)) + 0.5, mat["event"], fontsize=8, color=INK_2)
-    ax.tick_params(length=0)
-    for spine in ax.spines.values():
-        spine.set_visible(False)
     for i in range(vals.shape[0]):
         for j in range(vals.shape[1]):
             v = vals[i, j]
+            face = SURFACE if np.isnan(v) else cmap(norm(v))
+            ax.add_patch(Rectangle((j, row_tops[i]), 1, 1, facecolor=face, edgecolor=SURFACE, lw=2))
             if np.isnan(v):
-                ax.text(j + 0.5, i + 0.5, "–", ha="center", va="center", fontsize=7.5, color=MUTED)
+                ax.text(j + 0.5, row_tops[i] + 0.5, "–", ha="center", va="center", fontsize=7.5, color=MUTED)
             else:
-                color = "#ffffff" if abs(v) > 0.55 * vmax else INK
-                ax.text(j + 0.5, i + 0.5, f"{v:+.1f}", ha="center", va="center", fontsize=7.5, color=color)
-    cbar = fig.colorbar(mesh, ax=ax, fraction=0.04, pad=0.03)
-    cbar.ax.tick_params(labelsize=7, color=MUTED, labelcolor=MUTED)
+                dark = abs(v) > 0.55 * vmax
+                ax.text(
+                    j + 0.5, row_tops[i] + 0.4, f"{v:+.1f}", ha="center", va="center",
+                    fontsize=7.5, color="#ffffff" if dark else INK,
+                )
+                ax.text(
+                    j + 0.5, row_tops[i] + 0.76, f"n={int(ns[i, j]):,}", ha="center", va="center",
+                    fontsize=5.5, color="#ffffff" if dark else INK_2, alpha=0.85,
+                )
+    ax.set_xlim(0, len(PAIR_NAMES))
+    ax.set_ylim(y, 0)
+    ax.set_xticks(np.arange(len(PAIR_NAMES)) + 0.5, PAIR_NAMES, fontsize=8)
+    ax.set_yticks([t + 0.5 for t in row_tops], mat["event"], fontsize=8)
+    ax.tick_params(length=0)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    ax.set_title(
+        f"Average power index gap between equal-point swims\n{cohort}",
+        loc="left", fontsize=9.5, pad=10,
+    )
+    cbar = fig.colorbar(
+        ScalarMappable(norm=norm, cmap=cmap), ax=ax, fraction=0.045, pad=0.12, shrink=0.7
+    )
+    cbar.set_ticks([0])
+    cbar.ax.tick_params(labelsize=7, length=0)
     cbar.outline.set_visible(False)
-    fig.suptitle(
-        f"E_P[ΔΠ] by event and course pair — {GENDER_LABEL[gender]}",
-        x=0.02, y=0.985, ha="left", fontsize=10, fontweight="bold", color=INK,
+    cbar.ax.text(
+        0.5, 1.03, "first course\ndisadvantaged", transform=cbar.ax.transAxes,
+        ha="center", va="bottom", fontsize=7, color=INK_2,
     )
-    fig.text(
-        0.02, 0.955,
-        "ΔΠ > 0: meter course penalized · mean of K/P over clean\n"
-        f"best-per-athlete numerator-course swims{pop_note} · snapshot {snapshot_date}",
-        va="top", fontsize=8, color=INK_2,
+    cbar.ax.text(
+        0.5, -0.03, "first course\nadvantaged", transform=cbar.ax.transAxes,
+        ha="center", va="top", fontsize=7, color=INK_2,
     )
-    fig.tight_layout(rect=(0, 0, 1, 0.925))
+    fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
 
@@ -464,43 +501,25 @@ def swimmer_impact(best: pd.Series, record_bases: dict, pi_bases: dict, swimmer_
     return pd.DataFrame.from_records(rows).sort_values(["gender", "rank", "swimmer_id"]).reset_index(drop=True)
 
 
-def swimmer_impact_figure(impact: pd.DataFrame, snapshot_date: str, pop_note: str, out_path) -> None:
+def swimmer_impact_figure(impact: pd.DataFrame, out_path) -> None:
     """Exceedance curve: share of swimmers whose composite-index penalty is at
     least x. Reads directly as 'how many swimmers does the miscalibration hurt
     by this much or more' and absorbs the large unaffected-at-zero mass."""
     colors = {"M": "#2a78d6", "F": "#eb6834"}
-    fig, ax = plt.subplots(figsize=(9, 5.0))
+    fig, ax = plt.subplots(figsize=(7.5, 4.2))
     for gender in ("M", "F"):
         v = np.sort(impact[impact["gender"] == gender]["pi_penalty"].to_numpy(float))
         share_at_least = 1.0 - np.arange(len(v)) / len(v)
-        ax.step(v, share_at_least, where="post", color=colors[gender], lw=1.8, label=GENDER_LABEL[gender])
-        q50, q90 = np.percentile(v, [50, 90])
-        affected = np.mean(v > 1e-9)
-        ax.plot([q50], [0.5], marker="o", ms=6, color=colors[gender], mec=SURFACE, mew=1)
-        ax.annotate(
-            f"{GENDER_LABEL[gender]}: median {q50:+.1f} · p90 {q90:+.1f} · {affected:.0%} affected",
-            (q50, 0.5), xytext=(10, 14 if gender == "M" else -18), textcoords="offset points",
-            fontsize=7.5, color=INK_2,
-        )
+        ax.step(v, share_at_least, where="post", color=colors[gender], lw=1.5, label=GENDER_LABEL[gender])
     ax.axvline(0, color=BASELINE, lw=0.8)
     ax.set_ylim(0, 1.02)
     ax.set_yticks([0, 0.25, 0.5, 0.75, 1.0], ["0%", "25%", "50%", "75%", "100%"], fontsize=7.5)
-    ax.set_xlabel("composite-index penalty x (actual − course-neutral counterfactual, index points)", fontsize=8.5)
-    ax.set_ylabel("share of swimmers with penalty ≥ x", fontsize=8.5)
+    ax.set_xlabel("PI penalty x (index points)", fontsize=8.5)
+    ax.set_ylabel("share of swimmers ≥ x", fontsize=8.5)
     ax.legend(frameon=False, fontsize=8, loc="upper right")
     ax.tick_params(labelsize=7.5)
-    fig.suptitle(
-        "How many swimmers does the course miscalibration hurt, and by how much?",
-        x=0.01, ha="left", fontsize=11, fontweight="bold", color=INK,
-    )
-    fig.text(
-        0.01, 0.955,
-        "Per swimmer: composite PI (top-4, weights 1/1/0.25/0.05) minus its counterfactual where each scoring meter\n"
-        "swim is re-valued at its equal-WA-point yard score (yard-valued slots unchanged). Curve height at x = share\n"
-        f"of swimmers penalized by ≥ x points; left of 0 = favored. Population: clean bests{pop_note}. Snapshot {snapshot_date}.",
-        va="top", fontsize=7.5, color=INK_2,
-    )
-    fig.subplots_adjust(top=0.82, bottom=0.11, left=0.075, right=0.99)
+    ax.set_title("Composite-index penalty vs course-neutral counterfactual", loc="left", fontsize=10)
+    fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
 
@@ -520,14 +539,13 @@ def swarm_offsets(sorted_vals: np.ndarray, min_gap: float, step: float = 0.13) -
     return offsets
 
 
-def pair_distribution_figure(long: pd.DataFrame, snapshot_date: str, pop_note: str, out_path) -> None:
+def pair_distribution_figure(long: pd.DataFrame, out_path) -> None:
     pair_colors = {"LCM/SCY": "#2a78d6", "SCM/SCY": "#eb6834", "LCM/SCM": "#1baf7a"}
     fig, axes = plt.subplots(2, 1, figsize=(9.5, 5.8), sharex=True)
     valid = long[long["dpi_mean"].notna()]
     span = valid["dpi_mean"].max() - valid["dpi_mean"].min()
     for ax, gender in zip(axes, ("M", "F")):
         sub = valid[valid["gender"] == gender]
-        ax.grid(axis="x")
         ax.axvline(0, color=BASELINE, lw=0.8, zorder=1)
         for i, pair in enumerate(PAIR_NAMES):
             g = sub[sub["course_pair"] == pair].sort_values("dpi_mean")
@@ -544,22 +562,13 @@ def pair_distribution_figure(long: pd.DataFrame, snapshot_date: str, pop_note: s
                     (r["dpi_mean"], y + dy), xytext=(0, 8), textcoords="offset points",
                     ha="center", fontsize=6.5, color=INK_2, zorder=5,
                 )
-        ax.set_yticks(range(len(PAIR_NAMES) - 1, -1, -1), PAIR_NAMES, fontsize=8, color=INK_2)
+        ax.set_yticks(range(len(PAIR_NAMES) - 1, -1, -1), PAIR_NAMES, fontsize=8)
         ax.set_ylim(-0.6, len(PAIR_NAMES) - 0.4)
-        ax.set_title(GENDER_LABEL[gender], loc="left", fontsize=9, fontweight="bold", color=INK)
+        ax.set_title(GENDER_LABEL[gender], loc="left", fontsize=9)
         ax.tick_params(labelsize=7.5)
-    axes[-1].set_xlabel("E_P[ΔΠ] (index points) — > 0: meter course penalized", fontsize=8.5)
-    fig.suptitle(
-        "Distribution of expected ΔΠ across events, by course pair",
-        x=0.01, ha="left", fontsize=11, fontweight="bold", color=INK,
-    )
-    fig.text(
-        0.01, 0.955,
-        f"One dot per event: the ΔΠ(P) curve marginalized over clean best-per-athlete numerator-course swims{pop_note}.\n"
-        f"Vertical tick = median across events. Extremes labeled. Snapshot {snapshot_date}.",
-        va="top", fontsize=7.5, color=INK_2,
-    )
-    fig.subplots_adjust(top=0.85, bottom=0.1, left=0.08, right=0.99, hspace=0.32)
+    axes[-1].set_xlabel("E_P[ΔΠ] (index points)", fontsize=8.5)
+    fig.suptitle("E_P[ΔΠ] across events, by course pair", x=0.01, ha="left", fontsize=10)
+    fig.subplots_adjust(top=0.9, bottom=0.1, left=0.08, right=0.99, hspace=0.32)
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
 
@@ -648,6 +657,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--classes", nargs="*", type=int, default=[2027], help="recruiting classes to analyze")
     parser.add_argument(
+        "--datasets", nargs="*",
+        help="explicit processed snapshot names, e.g. swimcloud_2027_new (takes precedence over --classes)",
+    )
+    parser.add_argument(
+        "--snapshot-date", help="baseline snapshot date YYYY-MM-DD (default: latest retrieved_at date)",
+    )
+    parser.add_argument(
+        "--output-name", help="output directory name below data/processed/audit (default: delta_pi plus filters)",
+    )
+    parser.add_argument(
         "--max-rank", type=int, default=None,
         help="restrict the marginalization population to swimmers ranked <= N per gender (default: whole class)",
     )
@@ -661,16 +680,23 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.snapshot_date:
+        try:
+            date.fromisoformat(args.snapshot_date)
+        except ValueError as exc:
+            raise SystemExit("--snapshot-date must be a valid ISO date (YYYY-MM-DD)") from exc
+
     suffix = "".join(
         part for part, on in [(f"_top{args.max_rank}", args.max_rank), (f"_slots{args.top_events}", args.top_events)] if on
     )
-    rank_note = "" if args.max_rank is None else f", ranked top {args.max_rank}"
-    pop_note = rank_note + ("" if args.top_events is None else f", top-{args.top_events} scoring events only")
-    out_dir = PROCESSED_DIR / "audit" / f"delta_pi{suffix}"
+    output_name = args.output_name or f"delta_pi{suffix}"
+    if output_name in {"", ".", ".."} or output_name != Path(output_name).name:
+        raise SystemExit("--output-name must be a single directory name")
+    out_dir = PROCESSED_DIR / "audit" / output_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    swims = load_processed(args.classes)
-    snapshot_date = max(swims["retrieved_at"])[:10]
+    swims = load_processed_datasets(args.datasets) if args.datasets else load_processed(args.classes)
+    snapshot_date = args.snapshot_date or max(swims["retrieved_at"])[:10]
     us_open, us_open_asof = load_us_open_asof(snapshot_date)
     pi_bases = load_pi_base_times()
     if not pi_bases:
@@ -698,17 +724,19 @@ def main() -> None:
 
     n_figures = 0
     for gender in ("M", "F"):
+        cohort = GENDER_LABEL[gender] if args.max_rank is None else f"Top {args.max_rank} {GENDER_LABEL[gender]}"
         mat = matrix_frame(long, gender)
         mat.to_csv(out_dir / f"delta_pi_matrix_{gender}.csv", index=False)
-        matrix_figure(gender, mat, snapshot_date, pop_note, out_dir / f"delta_pi_matrix_{gender}.png")
+        n_mat = matrix_frame(long, gender, "n_athletes")
+        matrix_figure(mat, n_mat, cohort, out_dir / f"delta_pi_matrix_{gender}.png")
         n_figures += 1
         for pair in PAIR_NAMES:
             sub = long[(long["gender"] == gender) & (long["course_pair"] == pair)]
             if sub.empty:
                 continue
-            curves_figure(gender, pair, sub, p_arrays, pop_note, out_dir / f"delta_pi_curves_{gender}_{pair.replace('/', '-')}.png")
+            curves_figure(gender, pair, sub, p_arrays, cohort, out_dir / f"delta_pi_curves_{gender}_{pair.replace('/', '-')}.png")
             n_figures += 1
-    pair_distribution_figure(long, snapshot_date, pop_note, out_dir / "delta_pi_pair_distributions.png")
+    pair_distribution_figure(long, out_dir / "delta_pi_pair_distributions.png")
     n_figures += 1
 
     impact = None
@@ -721,19 +749,20 @@ def main() -> None:
         swimmer_info["published_pi"] = pd.to_numeric(swimmer_info["published_pi"], errors="coerce")
         impact = swimmer_impact(best, record_bases, pi_bases, swimmer_info)
         impact.to_csv(out_dir / "swimmer_impact.csv", index=False)
-        swimmer_impact_figure(impact, snapshot_date, rank_note, out_dir / "swimmer_impact_distribution.png")
+        swimmer_impact_figure(impact, out_dir / "swimmer_impact_distribution.png")
         n_figures += 1
 
     summary = build_summary(
         long, skipped, args.classes, snapshot_date, us_open_asof, args.max_rank, args.top_events, slot_stats, impact
     )
+    summary["processed_datasets"] = args.datasets or [f"swimcloud_{c}" for c in args.classes]
     (out_dir / "delta_pi_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
     slot_note = "" if slot_stats is None else (
         f", top-{args.top_events} slot reconstruction vs published PI: "
         f"median abs err {slot_stats['median_abs_err']} over {slot_stats['n_swimmers']} swimmers"
     )
     print(
-        f"delta_pi (classes {args.classes}, rank cutoff {args.max_rank or 'none'}): "
+        f"delta_pi (datasets {summary['processed_datasets']}, rank cutoff {args.max_rank or 'none'}): "
         f"{len(long)} event-pair rows, 2 matrices, {n_figures} figures "
         f"(snapshot {snapshot_date}){slot_note} -> {out_dir}"
     )

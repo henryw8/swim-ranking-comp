@@ -91,6 +91,10 @@ Notes on the data:
   can tie.
 - User-inputted, relay-leadoff, and extracted-split records are retained and
   explicitly flagged.
+- Newer power-index-cutoff exports may instead arrive as one CSV per gender
+  with ranking fields embedded in every swim row. `process_data.py --datasets`
+  detects this layout, combines the files, and derives one ranking row per
+  athlete without modifying the source exports.
 
 ## Processing
 
@@ -101,6 +105,18 @@ cross-course calibration note (`docs/Cross_Course_Calibration_Note_v10.pdf`):
 uv run scripts/process_data.py        # per class: data/processed/swimcloud_YYYY/
 uv run scripts/audit_calibration.py   # pooled:    data/processed/audit/
 uv run scripts/delta_pi_analysis.py   # curves:    data/processed/audit/delta_pi/
+```
+
+To process and analyze a named snapshot separately from the legacy class
+directory, use explicit dataset and output names. For example, the class-2027
+swims-through-2026-08-17 snapshot is reproduced with:
+
+```sh
+uv run scripts/process_data.py --datasets swimcloud_2027_new
+uv run scripts/delta_pi_analysis.py \
+  --datasets swimcloud_2027_new --snapshot-date 2026-08-17 \
+  --max-rank 1000 --top-events 4 --swimmer-impact \
+  --output-name delta_pi_2027_new_2026-08-17_top1000_slots4
 ```
 
 Per class, `process_data.py` writes:
